@@ -4,12 +4,14 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_event_loop.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_task_wdt.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -82,12 +84,15 @@ xQueueHandle ENCODER_evt_queue = NULL; // A queue to handle pulse counter events
 xQueueHandle ENDSTOP_evt_queue = NULL;
 xQueueHandle BUTTON_evt_queue = NULL;
 xQueueHandle NET_evt_queue = NULL;
+xQueueHandle TIMER_evt_queue = NULL;
 
 pcnt_isr_handle_t user_isr_handle_1 = NULL; //user's ISR service handle
 pcnt_isr_handle_t user_isr_handle_2 = NULL; //user's ISR service handle
 
 ledc_channel_config_t ledc_channel1;
 ledc_channel_config_t ledc_channel2;
+
+esp_timer_handle_t oneshot_timer;
 
 /* A sample structure to pass events from the PCNT
  * interrupt handler to the main program.*/
@@ -100,9 +105,12 @@ ENCODER_evt_t ENCODER_evt;
 uint32_t ENDSTOP_evt;
 uint32_t BUTTON_evt;
 uint32_t NET_evt;
+uint32_t TIMER_evt;
 
 uint32_t Debounce_BUTTON_UP = 0;
 uint32_t Debounce_BUTTON_DOWN = 0;
+
+void CheckNetState();
 
 typedef struct {
 	float motor_pwr_scale[3];
@@ -120,16 +128,6 @@ Accel_info accel_info = {
 		{ 10, 20, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 20, 10 }
 };
 
-/*
-Accel_info accel_info = {
-		{ 0.0f, 1.0f, 0.3f },
-		{ 0, 0, 0 },
-		{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 			//Will be filled up in the encoder setup
-		{ 20, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0 },
-		{ 20, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0 }
-};
-*/
-
 size_t Accel_info_size = sizeof(Accel_info);
 
 int16_t motorPosition[] = { 0, 0, 0 };
@@ -141,6 +139,9 @@ static uint32_t millis() {
 }
 
 void FillAccelSteps(){
+
+	printf("FillAccelSteps\n");
+
 	for(int i = 0; i < NUM_ACCEL_STEPS; i++){
 		accel_info.speeds_down[i] = 100;
 		accel_info.speeds_up[i] = 100;
@@ -166,6 +167,10 @@ int OtherM(int motor){
 	return 0;
 }
 
+void SetMotorPSU(bool state){
+	gpio_set_level(0, state);
+}
+
 bool BothEndstopsActivated(){
 	if( gpio_get_level(ENDSTOP_1) && gpio_get_level(ENDSTOP_2) ){
 		return true;
@@ -174,10 +179,18 @@ bool BothEndstopsActivated(){
 }
 
 bool BothButtonsActivated(){
-	if( gpio_get_level(BUTTON_DOWN) && gpio_get_level(BUTTON_DOWN) ){
+	if( gpio_get_level(BUTTON_DOWN) && gpio_get_level(BUTTON_UP) ){
 		return true;
 	}
 	return false;
+}
+
+bool UpButtonActivated(){
+	return gpio_get_level(BUTTON_UP);
+}
+
+bool DownButtonActivated(){
+	return gpio_get_level(BUTTON_DOWN);
 }
 
 static void IRAM_ATTR ENDSTOP_isr_handler(void *arg) {
@@ -252,6 +265,12 @@ static void IRAM_ATTR ENCODER_intr_handler(void *arg) {
 	}
 }
 
+static void oneshot_timer_callback(void* arg)
+{
+	TIMER_evt = 1;
+	xQueueSendFromISR(TIMER_evt_queue, &TIMER_evt, NULL);
+}
+
 static void NET_event_handler(void* arg, esp_event_base_t event_base,  int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -271,7 +290,6 @@ static void NET_event_handler(void* arg, esp_event_base_t event_base,  int32_t e
         ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-
     }
 }
 
@@ -313,6 +331,10 @@ void SetDirection(State direction) {
 	}
 }
 
+void SetTimer(int mSeconds){
+	ESP_ERROR_CHECK(esp_timer_start_once(oneshot_timer, mSeconds * 1000 ));
+}
+
 void WriteNVS(bool close) {
 	// Write
 	printf("Updating restart counter in NVS ... ");
@@ -347,6 +369,8 @@ static void tcp_server_task()
     printf("tcp_server_task");
 
     while (1) {
+
+    	vTaskDelay(10/portTICK_PERIOD_MS);
 
         struct sockaddr_in dest_addr;
         dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -388,6 +412,9 @@ static void tcp_server_task()
         ESP_LOGI(TAG, "Socket accepted");
 
         while (1) {
+
+        	vTaskDelay(10 /portTICK_PERIOD_MS);
+
             int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
             // Error occurred during receiving
             if (len < 0) {
@@ -455,6 +482,18 @@ static void tcp_server_task()
     vTaskDelete(NULL);
 }
 
+static void SetupTimer(){
+	printf("SetupTimer\n");
+	TIMER_evt_queue = xQueueCreate(10, sizeof(TIMER_evt));
+
+	const esp_timer_create_args_t oneshot_timer_args = {
+			.callback = &oneshot_timer_callback,
+			.name = "one-shot"
+	};
+
+	ESP_ERROR_CHECK(esp_timer_create(&oneshot_timer_args, &oneshot_timer));
+}
+
 static void SetupMotor_PWM() {
 	printf("SetupMotor_PWM\n");
 
@@ -513,7 +552,7 @@ static void SetupMotor_PWM() {
 
 static void SetupCounter() {
 
-	printf("counter_init\n");
+	printf("SetupCounter\n");
 
 	pcnt_config_t pcnt_config1;
 
@@ -586,6 +625,8 @@ static void SetupCounter() {
 }
 
 void SetupNVS() {
+
+	printf("SetupNVS\n");
 	// Initialize NVS
 	esp_err_t err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -625,6 +666,8 @@ void SetupNVS() {
 }
 
 void SetupRelays() {
+	printf("SetupRelays\n");
+
 	gpio_config_t io_conf;
 	//disable interrupt
 	io_conf.intr_type = GPIO_PIN_INTR_DISABLE;
@@ -673,8 +716,10 @@ void SetupEndpointsAndButtons() {
 
 }
 
-void SetupNetwork(){	//Needs SetupNVS()
+void SetupNetwork(){
+	printf("SetupNetwork\n");
 
+	//Needs SetupNVS()
 	s_wifi_event_group = xEventGroupCreate();
 
 	tcpip_adapter_init();
@@ -703,10 +748,10 @@ void SetupNetwork(){	//Needs SetupNVS()
 	ESP_LOGI(TAG, "SetupNetwork finished.");
 
 	NET_evt_queue = xQueueCreate(10, sizeof(uint32_t));
-
 }
 
 void SetupDebounce(){
+	printf("SetupDebounce\n");
 	Debounce_BUTTON_UP = millis();
 	Debounce_BUTTON_DOWN = millis();
 }
@@ -1066,53 +1111,6 @@ void TEST_NETWORK(){
 }
 */
 
-void Init(){
-
-	printf("->Init\n");
-
-	SetupNVS();
-
-	SetupRelays();
-
-	SetupMotor_PWM();
-
-	SetupCounter();
-
-	SetupEndpointsAndButtons();
-
-	SetupNetwork();
-
-	FillAccelSteps();
-
-	SetupDebounce();
-
-	printf("<-Init\n");
-}
-
-void CheckNetState(){
-	if (xQueueReceive(NET_evt_queue, &NET_evt, 0) == pdTRUE) {
-		if( NET_evt == 'D' && ELEVATOR_STATE == RESTING_UP){
-			ELEVATOR_STATE = MOVING_DOWN;
-		}
-		else if (NET_evt == 'U' && ELEVATOR_STATE == RESTING_DOWN ){
-			ELEVATOR_STATE = MOVING_UP;
-		}
-		else if (NET_evt == 'H' && ELEVATOR_STATE != DROPOUT){
-			ELEVATOR_STATE = HOMING;
-		}
-		else if (NET_evt == 'E' && ELEVATOR_STATE != HOMING){
-			ELEVATOR_STATE = DROPOUT;
-		}
-		else if (NET_evt == 'S' ){
-			ELEVATOR_STATE = STOPPED;
-		}
-		else{
-			printf("ELEVATOR_STATE == RESTING_UP - UNKNOWN NET EVENT: %c\n", NET_evt);
-		}
-	}
-}
-
-
 float FindScale(){
 
 	pcnt_get_counter_value(ENCODER_evt.unit, &(motorPosition[OtherM(ENCODER_evt.unit)]));
@@ -1123,45 +1121,26 @@ float FindScale(){
 	return 1.0f;
 }
 
-void State_RESTING_DOWN(){
-	if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE && BUTTON_evt == BUTTON_UP) {
-		ELEVATOR_STATE = MOVING_UP;
-	}
-	else{
-		printf("ELEVATOR_STATE == RESTING_DOWN - UNKNOWN BUTTON EVENT: %i\n", BUTTON_evt);
-	}
-
-	CheckNetState();
-
-	if( ELEVATOR_STATE == MOVING_UP){
-		printf("ELEVATOR_STATE == RESTING_DOWN -> MOVING UP\n");
-		SetDirection(MOVING_UP);
-		accel_info.position_index_motor[MOTOR_1] = 0;
-		accel_info.position_index_motor[MOTOR_2] = 0;
-		SetSpeed(MOTOR_1, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_1] ]);
-		SetSpeed(MOTOR_2, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_2] ]);
-		pcnt_counter_clear(MOTOR_1);
-		pcnt_counter_clear(MOTOR_2);
-		pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_1] ]);
-		pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_2] ]);
-	}
-	else{
-		printf("ELEVATOR_STATE == RESTING_DOWN - UNKNOWN EVENT: %i\n", BUTTON_evt);
-	}
+void GOTO_RESTING_DOWN(){
+	printf("GOTO_RESTING_DOWN\n");
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+	SetTimer(10000);
+	ELEVATOR_STATE = RESTING_DOWN;
 }
 
-void State_RESTING_UP(){
-	if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE && BUTTON_evt == BUTTON_DOWN) {
-		ELEVATOR_STATE = MOVING_DOWN;
-	}
-	else{
-		printf("ELEVATOR_STATE == RESTING_UP - UNKNOWN BUTTON EVENT: %i\n", BUTTON_evt);
-	}
+void GOTO_RESTING_UP(){
+	printf("GOTO_RESTING_UP\n");
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+	SetTimer(10000);
+	ELEVATOR_STATE = RESTING_UP;
+}
 
-	CheckNetState();
-
-
-	if( ELEVATOR_STATE == MOVING_DOWN){
+void GOTO_MOVING_DOWN(){
+	printf("GOTO_MOVING_DOWN\n");
+	if( ELEVATOR_STATE == RESTING_UP){
+		SetMotorPSU(1);
 		printf("ELEVATOR_STATE == RESTING_UP -> MOVING DOWN\n");
 		SetDirection(MOVING_DOWN);
 		accel_info.position_index_motor[MOTOR_1] = 0;
@@ -1172,7 +1151,88 @@ void State_RESTING_UP(){
 		pcnt_counter_clear(MOTOR_2);
 		pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_1] ]);
 		pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_2] ]);
+		ELEVATOR_STATE = MOVING_DOWN;
 	}
+}
+
+void GOTO_MOVING_UP(){
+	printf("GOTO_MOVING_UP\n");
+	if( ELEVATOR_STATE == RESTING_DOWN){
+		SetMotorPSU(1);
+		printf("ELEVATOR_STATE == RESTING_DOWN -> MOVING UP\n");
+		SetDirection(MOVING_UP);
+		accel_info.position_index_motor[MOTOR_1] = 0;
+		accel_info.position_index_motor[MOTOR_2] = 0;
+		SetSpeed(MOTOR_1, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_1] ]);
+		SetSpeed(MOTOR_2, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_2] ]);
+		pcnt_counter_clear(MOTOR_1);
+		pcnt_counter_clear(MOTOR_2);
+		pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_1] ]);
+		pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_2] ]);
+		ELEVATOR_STATE = MOVING_UP;
+	}
+}
+
+void GOTO_STOPPED(){
+	printf("GOTO_STOPPED\n");
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
+	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+	ELEVATOR_STATE = STOPPED;
+}
+
+void GOTO_HOMING(){
+	printf("GOTO_HOMING\n");
+
+	SetDirection(MOVING_UP);
+
+	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, MOVE_FRACTION);
+	pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, MOVE_FRACTION);
+
+	SetSpeed(MOTOR_1, HOMING_SPEED);
+	SetSpeed(MOTOR_2, HOMING_SPEED);
+
+	ELEVATOR_STATE = HOMING;
+
+	SetTimer(500);
+}
+
+void GOTO_DROPOUT(){
+	SetDirection(MOVING_DOWN);
+
+	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, MOVE_FRACTION);
+	pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, MOVE_FRACTION);
+
+	SetSpeed(MOTOR_1, DROPOUT_SPEED);
+	SetSpeed(MOTOR_2, DROPOUT_SPEED);
+
+	ELEVATOR_STATE = DROPOUT;
+}
+
+void State_RESTING_DOWN(){
+
+	if (xQueueReceive(TIMER_evt_queue, &TIMER_evt, 0) == pdTRUE) {
+		SetMotorPSU(0);
+	}
+	else if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE && BUTTON_evt == BUTTON_UP) {
+		GOTO_MOVING_UP();
+	}
+	else{
+		printf("ELEVATOR_STATE == RESTING_DOWN - UNKNOWN BUTTON EVENT: %i\n", BUTTON_evt);
+	}
+	CheckNetState();
+}
+
+void State_RESTING_UP(){
+	if (xQueueReceive(TIMER_evt_queue, &TIMER_evt, 0) == pdTRUE) {
+		SetMotorPSU(0);
+	}
+	else if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE && BUTTON_evt == BUTTON_DOWN) {
+		GOTO_MOVING_DOWN();
+	}
+	else{
+		printf("ELEVATOR_STATE == RESTING_UP - UNKNOWN BUTTON EVENT: %i\n", BUTTON_evt);
+	}
+	CheckNetState();
 }
 
 void State_MOVING_UP() {
@@ -1188,7 +1248,7 @@ void State_MOVING_UP() {
 	if( xQueueReceive(ENDSTOP_evt_queue, &ENDSTOP_evt, 0) == pdTRUE){
 		printf("	MOVING UP - Motor %i reached end stop\n", ENCODER_evt.unit);
 		if( BothEndstopsActivated() ){
-			ELEVATOR_STATE = RESTING_UP;
+			GOTO_RESTING_UP();
 		}
 	}
 }
@@ -1198,9 +1258,7 @@ void State_MOVING_DOWN() {
 	CheckNetState();
 
 	if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE) {
-		ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-		ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
-		ELEVATOR_STATE = STOPPED;
+		GOTO_STOPPED();
 	}
 
 	if (xQueueReceive(ENCODER_evt_queue, &ENCODER_evt, 0) == pdTRUE) {
@@ -1208,7 +1266,7 @@ void State_MOVING_DOWN() {
 			SetSpeed(ENCODER_evt.unit, FindScale() * accel_info.speeds_down[accel_info.position_index_motor[ ENCODER_evt.unit ]]);
 		}
 		if(accel_info.position_index_motor[ENCODER_evt.unit] == NUM_ACCEL_STEPS && accel_info.position_index_motor[ OtherM(ENCODER_evt.unit) ] == NUM_ACCEL_STEPS){
-			ELEVATOR_STATE = RESTING_DOWN;
+			GOTO_RESTING_DOWN();
 		}
 	}
 }
@@ -1217,7 +1275,10 @@ bool adjusting = false;
 
 void State_STOPPED(){
 
+	//printf("State_STOPPED\n");
+
 	if (xQueueReceive(BUTTON_evt_queue, &BUTTON_evt, 0) == pdTRUE && !adjusting) {
+
 		if(BUTTON_evt == BUTTON_DOWN){
 			gpio_set_level(DIRECTION_MOTOR_1, 0);
 		}
@@ -1243,46 +1304,48 @@ void State_STOPPED(){
 
 void State_HOMING(){
 
-	SetDirection(MOVING_UP);
-
-	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, MOVE_FRACTION);
-	pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, MOVE_FRACTION);
-
-	SetSpeed(MOTOR_1, HOMING_SPEED);
-	SetSpeed(MOTOR_2, HOMING_SPEED);
+	bool delayOver = false;
 
 	while(1){
 
-		CheckNetState();
+		vTaskDelay(10/portTICK_PERIOD_MS);
 
-		if( xQueueReceive(ENDSTOP_evt_queue, &ENDSTOP_evt, 0) == pdTRUE){
+		if(delayOver){
 
-			printf("	HOMING - Motor %i reached end stop\n", ENCODER_evt.unit);
-			if( BothEndstopsActivated() ){
-				ELEVATOR_STATE = RESTING_UP;
+			CheckNetState();
+
+			if( ( UpButtonActivated() && !DownButtonActivated() ) || ( !UpButtonActivated() && DownButtonActivated() ) ){
+				GOTO_STOPPED();
+			}
+
+			if( xQueueReceive(ENDSTOP_evt_queue, &ENDSTOP_evt, 0) == pdTRUE){
+				printf("	HOMING - Motor %i reached end stop\n", ENCODER_evt.unit);
+				if( BothEndstopsActivated() ){
+					GOTO_RESTING_UP();
+				}
+			}
+			if (ENCODER_evt.status & PCNT_STATUS_H_LIM_M) {
+				if ( accel_info.position_index_motor[ENCODER_evt.unit] > accel_info.position_index_motor[ OtherM(ENCODER_evt.unit) ] ){
+					SetSpeed(ENCODER_evt.unit, FindScale() * HOMING_SPEED);
+				}
+				else{
+					SetSpeed(ENCODER_evt.unit, HOMING_SPEED);
+				}
 			}
 		}
-		if (ENCODER_evt.status & PCNT_STATUS_H_LIM_M) {
-			if ( accel_info.position_index_motor[ENCODER_evt.unit] > accel_info.position_index_motor[ OtherM(ENCODER_evt.unit) ] ){
-				SetSpeed(ENCODER_evt.unit, FindScale() * HOMING_SPEED);
-			}
-			else{
-				SetSpeed(ENCODER_evt.unit, HOMING_SPEED);
+		else{
+			if (xQueueReceive(TIMER_evt_queue, &TIMER_evt, 0) == pdTRUE) {
+				delayOver = true;
 			}
 		}
 	}
 }
 
 void State_DROPOUT(){
-	SetDirection(MOVING_DOWN);
-
-	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, MOVE_FRACTION);
-	pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, MOVE_FRACTION);
-
-	SetSpeed(MOTOR_1, DROPOUT_SPEED);
-	SetSpeed(MOTOR_2, DROPOUT_SPEED);
 
 	while(1){
+
+		vTaskDelay(10/portTICK_PERIOD_MS);
 
 		CheckNetState();
 
@@ -1294,7 +1357,60 @@ void State_DROPOUT(){
 				SetSpeed(ENCODER_evt.unit, DROPOUT_SPEED);
 			}
 		}
+		if( BothButtonsActivated()){
+			GOTO_STOPPED();
+		}
 	}
+}
+
+void CheckNetState(){
+	if (xQueueReceive(NET_evt_queue, &NET_evt, 0) == pdTRUE) {
+		if( NET_evt == 'D' && ELEVATOR_STATE == RESTING_UP){
+			GOTO_MOVING_DOWN();
+		}
+		else if (NET_evt == 'U' && ELEVATOR_STATE == RESTING_DOWN ){
+			GOTO_MOVING_UP();
+		}
+		else if (NET_evt == 'H' && ELEVATOR_STATE != DROPOUT){
+			GOTO_HOMING();
+		}
+		else if (NET_evt == 'E' && ELEVATOR_STATE != HOMING){
+			GOTO_DROPOUT();
+		}
+		else if (NET_evt == 'S' ){
+			GOTO_STOPPED();
+		}
+		else{
+			printf("UNKNOWN NET EVENT: %c\n", NET_evt);
+		}
+	}
+}
+
+void Init(){
+
+	printf("->Init\n");
+
+	SetupNVS();
+
+	SetupRelays();
+
+	SetupMotor_PWM();
+
+	SetupCounter();
+
+	SetupEndpointsAndButtons();
+
+	SetupNetwork();
+
+	FillAccelSteps();
+
+	SetupDebounce();
+
+	SetupTimer();
+
+	GOTO_STOPPED();
+
+	printf("<-Init\n");
 }
 
 void app_main() {
@@ -1311,33 +1427,37 @@ void app_main() {
 
 	Init();
 
-	if( BothEndstopsActivated( )){
-		printf("	Elevator at home position\n");
-		ELEVATOR_STATE = RESTING_UP;
-	}
-	else{
-		printf("	Elevator homing\n");
-		ELEVATOR_STATE = HOMING;
-	}
-
 	while(1){
-		if(ELEVATOR_STATE == MOVING_DOWN){
-			State_MOVING_DOWN();
+
+		vTaskDelay(10/portTICK_PERIOD_MS);
+
+		if( BothEndstopsActivated( )){
+			printf("	Elevator at home position\n");
+			GOTO_RESTING_UP();
 		}
-		if(ELEVATOR_STATE == MOVING_UP){
-			State_MOVING_UP();
+		else if( BothButtonsActivated() ){
+			printf("	Elevator homing\n");
+			GOTO_HOMING();
 		}
-		if(ELEVATOR_STATE == RESTING_DOWN){
-			State_RESTING_DOWN();
+		else if( UpButtonActivated() ){
+			GOTO_MOVING_UP();
 		}
-		if(ELEVATOR_STATE == RESTING_UP){
-			State_RESTING_UP();
+		else if( DownButtonActivated() ){
+			GOTO_MOVING_DOWN();
 		}
-		if( ELEVATOR_STATE == STOPPED){
-			State_STOPPED();
-		}
-		if( ELEVATOR_STATE == HOMING){
-			State_HOMING();
-		}
+
+		if(ELEVATOR_STATE == MOVING_DOWN) State_MOVING_DOWN();
+
+		if(ELEVATOR_STATE == MOVING_UP) State_MOVING_UP();
+
+		if(ELEVATOR_STATE == RESTING_DOWN) State_RESTING_DOWN();
+
+		if(ELEVATOR_STATE == RESTING_UP) State_RESTING_UP();
+
+		if( ELEVATOR_STATE == STOPPED) State_STOPPED();
+
+		if( ELEVATOR_STATE == HOMING) State_HOMING();
+
+		if( ELEVATOR_STATE == DROPOUT) State_DROPOUT();
 	}
 }
