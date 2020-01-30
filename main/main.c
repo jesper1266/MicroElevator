@@ -26,9 +26,12 @@
 #include "tcpip_adapter.h"
 #include "soc/mcpwm_periph.h"
 
+//Forward declares
+void SetSpeed(int motor, int speed);
+
 
 typedef enum  {
-	MOVING_DOWN = 1, MOVING_UP, RESTING_UP, RESTING_DOWN, HOMING, DROPOUT, STOPPED, UNDEFINED
+	MOVING_DOWN = 1, MOVING_UP, RESTING_UP, RESTING_DOWN, HOMING, DROPOUT, STOPPED, TESTING, UNDEFINED
 } State;
 
 #define PWM_OUTPUT_1        32  //Set GPIO 8 as PWM0A
@@ -61,8 +64,8 @@ typedef enum  {
 #define DROPOUT_SPEED 20
 #define ADJUST_SPEED 20
 
-#define NUM_ACCEL_STEPS 40
-#define TOTAL_MOVE_COUNT 5000
+#define NUM_ACCEL_STEPS 1
+#define TOTAL_MOVE_COUNT 4700
 #define MOVE_FRACTION TOTAL_MOVE_COUNT/(NUM_ACCEL_STEPS + 1)
 #define MOVE_FRACTION_FLOAT (float)TOTAL_MOVE_COUNT/((float)NUM_ACCEL_STEPS + 1.0f)
 
@@ -81,7 +84,6 @@ nvs_handle_t flash_handle;
 
 xQueueHandle ENCODER_evt_queue = NULL; // A queue to handle pulse counter events
 xQueueHandle ENDSTOP_evt_queue = NULL;
-//xQueueHandle BUTTON_evt_queue = NULL;
 xQueueHandle NET_evt_queue = NULL;
 xQueueHandle TIMER_evt_queue = NULL;
 
@@ -116,6 +118,8 @@ bool BUTTON_DEADBAND = false;
 void CheckNetState();
 
 typedef struct {
+	float motorFactor[3];
+	bool motor_state_[3];
 	int position_index_motor[3];
 	int positions[NUM_ACCEL_STEPS];
 	int speeds_down[NUM_ACCEL_STEPS];
@@ -123,6 +127,8 @@ typedef struct {
 } Accel_info;
 
 Accel_info accel_info = {
+		{ 0, 1.0, 1.0 },	//Motor speed factor
+		{false, false, false},
 		{ 0, 0, 0 },
 		{ 0 }, 			//Will be filled up in the encoder setup
 		{ 0 }, 			//Will be filled up in the encoder setup
@@ -147,7 +153,6 @@ void FillAccelSteps(){
 		accel_info.positions[i] = MOVE_FRACTION;
 		accel_info.speeds_down[i] = 100;
 		accel_info.speeds_up[i] = 100;
-
 	}
 
 	accel_info.speeds_down[0] = 20;
@@ -222,7 +227,13 @@ static void IRAM_ATTR ENCODER_intr_handler(void *arg) {
 		if (intr_status & (BIT(i))) {
 			evt.unit = i;
 
-			if( ELEVATOR_STATE == HOMING || ELEVATOR_STATE == DROPOUT){		//Sync motors when homing
+			if( ELEVATOR_STATE == TESTING ){
+				accel_info.position_index_motor[evt.unit]++;
+				if(accel_info.position_index_motor[evt.unit] == NUM_ACCEL_STEPS){
+					ledc_stop(LEDC_LOW_SPEED_MODE, evt.unit, 0);
+				}
+			}
+			else if( ELEVATOR_STATE == HOMING || ELEVATOR_STATE == DROPOUT){		//Sync motors when homing
 				accel_info.position_index_motor[evt.unit]++;
 				evt.info = 1;
 			}
@@ -242,8 +253,6 @@ static void IRAM_ATTR ENCODER_intr_handler(void *arg) {
 				}
 			}
 
-			/* Save the PCNT event type that caused an interrupt
-			 to pass it to the main program */
 			evt.status = PCNT.status_unit[i].val;
 			PCNT.int_clr.val = BIT(i);
 			xQueueSendFromISR(ENCODER_evt_queue, &evt, &HPTaskAwoken);
@@ -284,16 +293,26 @@ static void NET_event_handler(void* arg, esp_event_base_t event_base,  int32_t e
 
 void SetSpeed(int motor, int speed) {
 	if (motor == MOTOR_1) {
-		ledc_channel1.duty = (1024 * speed) / 100;
-		printf("			SetSpeed motor: %i speed: %i\n", motor, ledc_channel1.duty);
-		ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ledc_channel1.duty);
-		ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+		if( speed == 0){
+			ledc_stop(LEDC_LOW_SPEED_MODE, MOTOR_1, 0);
+		}
+		else{
+			ledc_channel1.duty = accel_info.motorFactor[1]*(1024 * speed) / 100;
+			printf("			SetSpeed motor: %i speed: %i\n", motor, ledc_channel1.duty);
+			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, ledc_channel1.duty);
+			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+		}
 	}
 	else{
-		ledc_channel2.duty = (1024 * speed) / 100;
-		printf("			SetSpeed motor: %i speed: %i\n", motor, ledc_channel2.duty);
-		ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, ledc_channel2.duty);
-		ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+		if( speed == 0){
+			ledc_stop(LEDC_LOW_SPEED_MODE, MOTOR_2, 0);
+		}
+		else{
+			ledc_channel2.duty = accel_info.motorFactor[2]*(1024 * speed) / 100;
+			printf("			SetSpeed motor: %i speed: %i\n", motor, ledc_channel2.duty);
+			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, ledc_channel2.duty);
+			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2);
+		}
 	}
 }
 
@@ -585,9 +604,9 @@ static void SetupCounter() {
 	pcnt_unit_config(&pcnt_config2);
 
 	/* Configure and enable the input filter */
-	pcnt_set_filter_value(PCNT_UNIT_1, 100);
+	pcnt_set_filter_value(PCNT_UNIT_1, 50);
 	pcnt_filter_enable(PCNT_UNIT_1);
-	pcnt_set_filter_value(PCNT_UNIT_2, 100);
+	pcnt_set_filter_value(PCNT_UNIT_2, 50);
 	pcnt_filter_enable(PCNT_UNIT_2);
 
 	/* Enable events on zero, maximum and minimum limit values */
@@ -766,8 +785,8 @@ void GOTO_RESTING_DOWN(){
 
 void GOTO_RESTING_UP(){
 	printf("GOTO_RESTING_UP\n");
-	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-	ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_2, 0);
+	SetSpeed(MOTOR_1, 0);
+	SetSpeed(MOTOR_2, 0);
 	ELEVATOR_STATE = RESTING_UP;
 	ENTERING_STATE = true;
 }
@@ -867,6 +886,7 @@ void State_RESTING_DOWN(){
 	else if (UpButtonActivated()) {
 		printf("RESTING_DOWN - Button event received - BUTTON_UP\n");
 		GOTO_MOVING_UP();
+		return;
 	}
 	else{
 		printf("ELEVATOR_STATE == RESTING_DOWN - UNKNOWN BUTTON EVENT: %i\n", BUTTON_evt);
@@ -877,6 +897,8 @@ void State_RESTING_DOWN(){
 void State_RESTING_UP(){
 	if( ENTERING_STATE ){
 		printf("State_RESTING_UP\n");
+		xQueueReset(ENCODER_evt_queue);
+		xQueueReset(ENDSTOP_evt_queue);
 		ENTERING_STATE = false;
 	}
 	if (xQueueReceive(TIMER_evt_queue, &TIMER_evt, 0) == pdTRUE) {
@@ -886,6 +908,7 @@ void State_RESTING_UP(){
 	else if (DownButtonActivated()) {
 		printf("RESTING_UP - Button event received - BUTTON_DOWN\n");
 		GOTO_MOVING_DOWN();
+		return;
 	}
 	CheckNetState();
 }
@@ -909,6 +932,7 @@ void State_MOVING_UP() {
 		if( BothEndstopsActivated() ){
 			printf("		MOVING UP - Both Motors reached end stop\n");
 			GOTO_RESTING_UP();
+			return;
 		}
 	}
 }
@@ -925,6 +949,7 @@ void State_MOVING_DOWN() {
 	if (BothButtonsActivated()) {
 		printf("MOVING_DOWN - Button event received - %i\n", BUTTON_evt);
 		GOTO_STOPPED();
+		return;
 	}
 
 	if (xQueueReceive(ENCODER_evt_queue, &ENCODER_evt, 0) == pdTRUE) {
@@ -935,6 +960,7 @@ void State_MOVING_DOWN() {
 		if(accel_info.position_index_motor[ENCODER_evt.unit] == NUM_ACCEL_STEPS && accel_info.position_index_motor[ OtherM(ENCODER_evt.unit) ] == NUM_ACCEL_STEPS){
 			printf("	MOVING DOWN - End reached\n");
 			GOTO_RESTING_DOWN();
+			return;
 		}
 	}
 }
@@ -949,6 +975,7 @@ void State_STOPPED(){
 	if (BothButtonsActivated()) {
 		printf("STOPPED - Button event received - %i\n", BUTTON_evt);
 		GOTO_HOMING();
+		return;
 	}
 	CheckNetState();
 }
@@ -967,25 +994,20 @@ void State_HOMING(){
 	if( BothEndstopsActivated()){
 		printf("		HOMING - Both Motors reached end stop\n");
 		GOTO_RESTING_UP();
+		return;
 	}
 	if (xQueueReceive(ENCODER_evt_queue, &ENCODER_evt, 0) == pdTRUE) {
 		if (ENCODER_evt.status & PCNT_STATUS_H_LIM_M) {
 			if ( accel_info.position_index_motor[ENCODER_evt.unit] > accel_info.position_index_motor[ OtherM(ENCODER_evt.unit) ] ){
-				SetSpeed(ENCODER_evt.unit, HOMING_SPEED/2);
+				SetSpeed(ENCODER_evt.unit, 0);
 				SetSpeed(OtherM(ENCODER_evt.unit), HOMING_SPEED);
 			}
 			else{
 				SetSpeed(ENCODER_evt.unit, HOMING_SPEED);
-				SetSpeed(OtherM(ENCODER_evt.unit), HOMING_SPEED/2);
+				SetSpeed(OtherM(ENCODER_evt.unit), 0);
 			}
 		}
 		printf("	HOMING - Info = %i - Pos indexes: %i, %i \n",ENCODER_evt.info, accel_info.position_index_motor[MOTOR_1], accel_info.position_index_motor[MOTOR_2]);
-	}
-
-	if( BothButtonsActivated() ){
-		printf("HOMING - Button event received - %i - KILLING motors\n", BUTTON_evt);
-		SetSpeed(MOTOR_1, 0);
-		SetSpeed(MOTOR_2, 0);
 	}
 }
 
@@ -1020,22 +1042,27 @@ void CheckNetState(){
 		if( NET_evt == 'D' && ELEVATOR_STATE == RESTING_UP){
 			printf("CheckNetState - RESTING_UP -> GOTO_MOVING_DOWN\n");
 			GOTO_MOVING_DOWN();
+			return;
 		}
 		else if (NET_evt == 'U' && ELEVATOR_STATE == RESTING_DOWN ){
 			printf("CheckNetState - RESTING_DOWN -> GOTO_MOVING_UP\n");
 			GOTO_MOVING_UP();
+			return;
 		}
 		else if (NET_evt == 'H' && ELEVATOR_STATE != DROPOUT){
 			printf("CheckNetState - != DROPOUT -> GOTO_HOMING\n");
 			GOTO_HOMING();
+			return;
 		}
 		else if (NET_evt == 'E' && ELEVATOR_STATE != HOMING){
 			printf("CheckNetState - DROPOUT -> GOTO_DROPOUT\n");
 			GOTO_DROPOUT();
+			return;
 		}
 		else if (NET_evt == 'S' ){
 			printf("CheckNetState -> GOTO_STOPPED\n");
 			GOTO_STOPPED();
+			return;
 		}
 		else{
 			printf("UNKNOWN NET EVENT: %c\n", NET_evt);
@@ -1068,6 +1095,7 @@ void Init(){
 	printf("<-Init\n");
 
 	GOTO_STOPPED();
+	return;
 }
 
 void TEST_MOTOR(){
@@ -1438,12 +1466,63 @@ void TEST_ENCODER(){
 		printf("Encoder value for motor 2: %i\n", value2);
 	}
 }
+
+void TEST_SHAFT_LENGTH(){
+	printf("TEST_SHAFT_LENGTH\n");
+	ELEVATOR_STATE = TESTING;
+	SetMotorPSU(1);
+	SetDirection(MOVING_DOWN);
+	accel_info.position_index_motor[MOTOR_1] = 0;
+	accel_info.position_index_motor[MOTOR_2] = 0;
+	SetSpeed(MOTOR_1, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_1] ]);
+	SetSpeed(MOTOR_2, accel_info.speeds_up[ accel_info.position_index_motor[MOTOR_2] ]);
+	pcnt_counter_clear(MOTOR_1);
+	pcnt_counter_clear(MOTOR_2);
+	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_1] ]);
+	pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, accel_info.positions[ accel_info.position_index_motor[MOTOR_2] ]);
+
+	while(1){
+
+	}
+}
+
+void TEST_MOVE(){
+	printf("TEST_MOVE\n");
+	ELEVATOR_STATE = TESTING;
+	SetMotorPSU(1);
+	SetDirection(MOVING_DOWN);
+	accel_info.position_index_motor[MOTOR_1] = 0;
+	accel_info.position_index_motor[MOTOR_2] = 0;
+
+	pcnt_counter_clear(MOTOR_1);
+	//pcnt_counter_clear(MOTOR_2);
+	pcnt_set_event_value(MOTOR_1, PCNT_EVT_H_LIM, 4700 );
+	//pcnt_set_event_value(MOTOR_2, PCNT_EVT_H_LIM, 4700 );
+
+	SetSpeed(MOTOR_1, 30);
+	//SetSpeed(MOTOR_2, 30);
+
+	int16_t value1;
+	int16_t value2;
+
+	while(1){
+		pcnt_get_counter_value(MOTOR_1, &value1);
+		printf("Encoder value for motor 1: %i\n", value1);
+		pcnt_get_counter_value(MOTOR_2, &value2);
+		printf("Encoder value for motor 2: %i\n", value2);
+	}
+}
+
 void app_main() {
 
 	printf("Starting Elevator Firmware\n");
 
 	Init();
 
+	TEST_MOVE();
+
+	//TEST_SHAFT_LENGTH();
+/*
 	while(1){
 
 		vTaskDelay(10/portTICK_PERIOD_MS);
@@ -1462,4 +1541,5 @@ void app_main() {
 
 		if( ELEVATOR_STATE == DROPOUT) State_DROPOUT();
 	}
+*/
 }
